@@ -1,0 +1,18 @@
+# youtube-converter/.dockerignore
+
+# Ignore Python specific files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ignore Git related files
+.git/
+.gitignore
+
+# Ignore any virtual environment directories
+venv/
+.venv/
+env/
+
+# Ignore temporary download files - crucial to keep image small
+temp_downloads/
