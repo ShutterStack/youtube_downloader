@@ -6,6 +6,7 @@ import tempfile
 import re
 import time
 import glob # Import glob for file searching
+import shutil # Add this import at the top with other imports
 
 # --- Configuration ---
 TEMP_DIR = "temp_downloads"
@@ -55,23 +56,30 @@ def get_content_info(url):
             'format': 'all',
             'force_generic_extractor': True,
             'retries': 3,
-            'extract_flat': False # Crucial for getting full info for entries in a playlist
+            'extract_flat': False, # Crucial for getting full info for entries in a playlist
+            'ignore_errors': True # <--- ADDED THIS LINE for playlist resilience
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
             if not info:
+                # If info is None even with ignore_errors, it means playlist itself might be entirely invalid
+                st.error("Could not retrieve any information for the provided URL. It might be invalid or completely unavailable.")
                 return None, None, None # info, is_playlist, entries_list
 
             is_playlist = info.get('_type') == 'playlist'
             
             if is_playlist:
                 entries = info.get('entries', [])
-                # Filter out None entries (e.g., private/deleted videos in a playlist)
-                entries = [e for e in entries if e is not None]
+                # Filter out None entries and entries marked as explicitly unavailable/private
+                # yt-dlp might return None for some entries if they're unavailable/deleted
+                # or an entry dictionary with 'availability': 'unavailable'
+                entries = [e for e in entries if e is not None and e.get('availability') not in ['private', 'unlisted', 'unavailable']]
                 return info, is_playlist, entries # main playlist info, True, list of video infos
             else:
-                return info, is_playlist, [info] # main video info, False, list containing single video info
+                # For single videos, if info is not None but status is unavailable,
+                # we should still return it so the main app can show the error from yt-dlp.
+                return info, is_playlist, [info]
 
     except yt_dlp.utils.DownloadError as e:
         st.error(f"Error fetching content info: {e}")
@@ -93,12 +101,23 @@ def generate_download_options(info, output_type):
     ), reverse=True)
 
     if output_type == 'mp4':
-        # Add "Video + Audio (Merged)" options for MP4 output
+        # Add "Best Video + Best Audio (Merged MP4 - Recommended)" option at the top
+        options.append({
+            'label': 'Best Video + Best Audio (Merged MP4 - Recommended)',
+            'format_id': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio', # Prioritize mp4+m4a, fallback to any best
+            'is_merged': True,
+            'ext': 'mp4', # Explicitly set expected output extension
+            'vcodec': 'best',
+            'acodec': 'aac (re-encoded)',
+            'resolution': 'best'
+        })
+
+        # Add "Video + Audio (Merged)" options for specific MP4 qualities
         merged_video_qualities = set()
         for f in formats:
-            # Filter for video-only MP4 formats to ensure proper merging with 'bestaudio'
-            if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('ext') == 'mp4' and f.get('height') and f.get('height') not in merged_video_qualities:
-                # Add an option for this video quality merged with best audio
+            # Filter for video-only MP4 formats that have a height, and haven't been added yet
+            if (f.get('vcodec') != 'none' and f.get('acodec') == 'none' and 
+                f.get('ext') == 'mp4' and f.get('height') and f.get('height') not in merged_video_qualities):
                 options.append({
                     'label': f"Video {f['height']}p ({f['ext']}) + Best Audio (Merged MP4)",
                     'format_id': f"{f['format_id']}+bestaudio",
@@ -109,17 +128,6 @@ def generate_download_options(info, output_type):
                     'resolution': f.get('resolution')
                 })
                 merged_video_qualities.add(f['height'])
-        
-        # Add a general "Best Video + Best Audio (Merged MP4 - Recommended)" option
-        options.insert(0, {
-            'label': 'Best Video + Best Audio (Merged MP4 - Recommended)',
-            'format_id': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio', # Prioritize mp4+m4a, fallback to any best
-            'is_merged': True,
-            'ext': 'mp4', # Explicitly set expected output extension
-            'vcodec': 'best',
-            'acodec': 'aac (re-encoded)',
-            'resolution': 'best'
-        })
         
         # Add "Video Only" options (MP4 and WebM)
         video_only_options = []
@@ -138,11 +146,22 @@ def generate_download_options(info, output_type):
         options.extend(video_only_options)
 
     elif output_type == 'mp3':
+        # Add a general "Best Audio (Converted to MP3 - Recommended)" option
+        options.append({
+            'label': 'Best Audio (Converted to MP3 - Recommended)',
+            'format_id': 'bestaudio',
+            'is_merged': False,
+            'ext': 'mp3',
+            'vcodec': 'none',
+            'acodec': 'mp3 (re-encoded)',
+            'resolution': 'N/A'
+        })
         # Add "Audio Only" options for MP3 output
+        audio_only_options = []
         for f in formats:
-            if f.get('acodec') != 'none': # Check if it has an audio codec
+            if f.get('acodec') != 'none' and f.get('vcodec') == 'none': # Ensure it's truly audio-only
                 label = f"Audio Only ({f.get('acodec', '')}, {f.get('abr', 0)}kbps)"
-                options.append({
+                audio_only_options.append({
                     'label': label,
                     'format_id': f['format_id'],
                     'is_merged': False, # Even if it's bestaudio, it's not merged video+audio
@@ -151,6 +170,7 @@ def generate_download_options(info, output_type):
                     'acodec': f.get('acodec'),
                     'resolution': f.get('resolution')
                 })
+        options.extend(audio_only_options)
     
     return options
 
@@ -470,8 +490,9 @@ if video_url:
 
         else: # Single video mode
             st.subheader(f"Video Title: {info.get('title', 'N/A')}")
+            # Deprecated parameter fix for st.image (replaced use_column_width=True with width)
             if 'thumbnail' in info:
-                st.image(info['thumbnail'], caption="Video Thumbnail", use_column_width=True)
+                st.image(info['thumbnail'], caption="Video Thumbnail", use_container_width=True)
 
             output_type = st.radio(
                 "Select Final Output Type:",
