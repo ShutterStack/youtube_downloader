@@ -14,7 +14,7 @@ MAX_FILE_SIZE_MB = 500
 # IMPORTANT: Adjust this path if your ffmpeg.exe is located elsewhere!
 # On Windows, it should point directly to ffmpeg.exe
 # On Linux/macOS, it's usually just 'ffmpeg' if it's in your PATH, or a full path like '/usr/bin/ffmpeg'
-FFMPEG_LOCATION = r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe' # Adjusted for Windows based on your logs
+FFMPEG_LOCATION = 'ffmpeg' # Adjusted for Windows based on your logs
 
 
 # --- Helper Functions ---
