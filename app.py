@@ -5,10 +5,17 @@ import shutil
 import tempfile
 import re
 import time
+import glob # Import glob for file searching
 
 # --- Configuration ---
-TEMP_DIR = "temp_downloads"
+TEMP_DIR = "temporary_downloads"
 MAX_FILE_SIZE_MB = 500
+# Ensure ffmpeg_location is correctly set for your system
+# IMPORTANT: Adjust this path if your ffmpeg.exe is located elsewhere!
+# On Windows, it should point directly to ffmpeg.exe
+# On Linux/macOS, it's usually just 'ffmpeg' if it's in your PATH, or a full path like '/usr/bin/ffmpeg'
+FFMPEG_LOCATION = r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe' # Adjusted for Windows based on your logs
+
 
 # --- Helper Functions ---
 def create_temp_dir():
@@ -19,7 +26,7 @@ def clean_temp_dir():
     if os.path.exists(TEMP_DIR):
         try:
             shutil.rmtree(TEMP_DIR)
-            st.toast("Cleaned up temporary files!", icon="🧹")
+            st.toast("Cleaned up temporary files! ✅", icon="🧹")
             os.makedirs(TEMP_DIR)
         except OSError as e:
             st.warning(f"Error cleaning up temp directory: {e}")
@@ -29,424 +36,313 @@ def clean_temp_dir():
 # Ensure temp directory exists at app startup
 create_temp_dir()
 
+# Sanitize filenames for various OS compatibility
+def sanitize_filename(filename):
+    # Remove characters illegal in Windows filenames, and trim leading/trailing spaces/dots
+    cleaned_filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+    # Also remove any characters that might cause issues with pathing or globbing if they appear unexpectedly
+    # For robust matching, we might also replace spaces with underscores or similar if exact matches are needed,
+    # but for simple globbing, spaces are usually fine.
+    # Replace sequences of dots at the end (common issue with some filenames)
+    cleaned_filename = re.sub(r'\.+$', '', cleaned_filename)
+    return cleaned_filename.strip() # Remove leading/trailing whitespace
+
+# Cache video info to avoid re-fetching on every rerun
+@st.cache_data(show_spinner="Fetching video information...")
 def get_video_info_and_formats(url):
     try:
         ydl_opts = {
             'noplaylist': True,
             'quiet': True,
             'skip_download': True,
-            'format': 'all',
+            'format': 'all', # Get all formats to allow flexible selection
             'force_generic_extractor': True,
             'retries': 3,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                st.error("No information found for this URL.")
-                return None, None, None, None
-
-            title = info.get('title', 'Unknown Title')
-            thumbnail = info.get('thumbnail', '')
-            duration = info.get('duration')
-            
-            available_formats = []
-            if 'formats' in info:
-                for f in info['formats']:
-                    format_id = f.get('format_id')
-                    ext = f.get('ext')
-                    acodec = f.get('acodec')
-                    vcodec = f.get('vcodec')
-                    format_note = f.get('format_note', '')
-                    resolution = f.get('resolution')
-                    
-                    description_parts = []
-                    
-                    if resolution and resolution != "audio only":
-                        description_parts.append(resolution)
-                    
-                    if vcodec and vcodec != "none":
-                        description_parts.append(vcodec)
-                    
-                    abr_display = "N/A"
-                    abr_val = 0
-                    if f.get('abr') is not None and acodec != "none":
-                        try:
-                            abr_val = int(f['abr'])
-                            abr_display = f"{abr_val}kbps"
-                        except (ValueError, TypeError):
-                            pass 
-
-                    if acodec and acodec != "none":
-                        description_parts.append(f"{acodec} {abr_display}")
-                    
-                    if format_note:
-                        description_parts.append(f"({format_note})")
-                    
-                    tbr_val = 0
-                    if f.get('tbr') is not None:
-                        try:
-                            tbr_val = int(f['tbr'])
-                        except (ValueError, TypeError):
-                            pass
-
-                    if description_parts and format_id:
-                        full_description = f"{format_id}: {ext} - {' '.join(description_parts)}"
-                        available_formats.append({
-                            'format_id': format_id,
-                            'ext': ext,
-                            'description': full_description,
-                            'vcodec': vcodec,
-                            'acodec': acodec,
-                            'resolution': resolution,
-                            'abr': abr_val,
-                            'tbr': tbr_val,
-                            'filesize': f.get('filesize', f.get('filesize_approx')), # Include filesize for decision
-                        })
-            
-            def get_res_height(res_str):
-                if res_str and 'x' in res_str:
-                    try:
-                        return int(res_str.split('x')[1])
-                    except ValueError:
-                        pass
-                return 0
-
-            # Sorting all formats initially for consistent internal data,
-            # then filtering for display
-            available_formats.sort(key=lambda x: (
-                get_res_height(x.get('resolution')),
-                x.get('abr', 0),
-                x.get('tbr', 0)
-            ), reverse=True)
-
-            return title, thumbnail, duration, available_formats
+                return None, None
+            return info, ydl.sanitize_info(info) # Return sanitized info for easier processing
     except yt_dlp.utils.DownloadError as e:
-        st.error(f"Error fetching video info: {e}. This might be due to geo-restrictions, private video, or YouTube changes.")
-        return None, None, None, None
+        st.error(f"Error fetching video info: {e}")
+        return None, None
     except Exception as e:
-        st.error(f"An unexpected error occurred while processing video info: {e}. Please try a different URL.")
-        st.exception(e)
-        return None, None, None, None
+        st.error(f"An unexpected error occurred: {e}")
+        return None, None
 
-def download_file(url, format_id, final_output_type, progress_bar, status_text, title_prefix=""):
-    create_temp_dir()
 
-    safe_title_prefix = re.sub(r'[\\/:*?"<>|]', '', title_prefix).strip()
-    if not safe_title_prefix:
-        safe_title_prefix = "download"
-
-    output_filename_template = os.path.join(TEMP_DIR, f"{safe_title_prefix}_%(format_id)s.%(ext)s")
+# Function to dynamically generate download options based on desired output type
+def generate_download_options(info, output_type):
+    options = []
     
-    final_filepath = None
+    # Sort formats by quality (higher resolution first, then higher fps)
+    formats = sorted(info['formats'], key=lambda f: (
+        f.get('height') or 0, 
+        f.get('fps') or 0, 
+        f.get('tbr') or 0 # Total bitrate
+    ), reverse=True)
 
-    def hook(d):
-        if d['status'] == 'downloading':
-            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-            downloaded_bytes = d.get('downloaded_bytes', 0)
-            if total_bytes and total_bytes > 0:
-                progress = int((downloaded_bytes / total_bytes) * 100)
-                progress_bar.progress(progress)
-                status_text.text(f"Downloading: {d['_percent_str']} of {d['_total_bytes_str']} at {d['_speed_str']}")
-            else:
-                status_text.text(f"Downloading: {d['_speed_str']} ({d['elapsed_str']} elapsed)")
-        elif d['status'] == 'finished':
-            progress_bar.progress(100)
-            status_text.text("Download complete. Processing...")
-        elif d['status'] == 'postprocessing':
-            status_text.text(f"Post-processing: {d.get('info_dict', {}).get('postprocess_info', '...')}")
+    if output_type == 'mp4':
+        # Add "Video + Audio (Merged)" options for MP4 output
+        # We need distinct options for different video qualities + best audio
+        merged_video_qualities = set()
+        for f in formats:
+            if f.get('vcodec') != 'none' and f.get('ext') == 'mp4' and f.get('height') and f.get('height') not in merged_video_qualities:
+                # Add an option for this video quality merged with best audio
+                options.append({
+                    'label': f"Video {f['height']}p ({f['ext']}) + Best Audio (Merged MP4)",
+                    'format_id': f"{f['format_id']}+bestaudio",
+                    'is_merged': True,
+                    'ext': 'mp4', # Explicitly set expected output extension
+                    'vcodec': f.get('vcodec'),
+                    'acodec': 'aac (re-encoded)', # Indicate it will be re-encoded
+                    'resolution': f.get('resolution')
+                })
+                merged_video_qualities.add(f['height'])
+        
+        # Add a general "Best Video + Best Audio (Merged MP4 - Recommended)" option
+        options.insert(0, {
+            'label': 'Best Video + Best Audio (Merged MP4 - Recommended)',
+            'format_id': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio', # Prioritize mp4+m4a, fallback to any best
+            'is_merged': True,
+            'ext': 'mp4', # Explicitly set expected output extension
+            'vcodec': 'best',
+            'acodec': 'aac (re-encoded)',
+            'resolution': 'best'
+        })
+        
+        # Add "Video Only" options (MP4 and WebM)
+        video_only_options = []
+        for f in formats:
+            if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('ext') in ['mp4', 'webm']:
+                label = f"Video Only {f.get('resolution', '')} ({f.get('ext')}, {f.get('vcodec')})"
+                video_only_options.append({
+                    'label': label,
+                    'format_id': f['format_id'],
+                    'is_merged': False,
+                    'ext': f['ext'], # Explicitly set expected output extension
+                    'vcodec': f.get('vcodec'),
+                    'acodec': f.get('acodec'),
+                    'resolution': f.get('resolution')
+                })
+        options.extend(video_only_options)
+
+    elif output_type == 'mp3':
+        # Add "Audio Only" options for MP3 output
+        for f in formats:
+            if f.get('acodec') != 'none': # Check if it has an audio codec
+                label = f"Audio Only ({f.get('acodec', '')}, {f.get('abr', 0)}kbps)"
+                options.append({
+                    'label': label,
+                    'format_id': f['format_id'],
+                    'is_merged': False, # Even if it's bestaudio, it's not merged video+audio
+                    'ext': 'mp3', # Explicitly set expected output extension (due to postprocessor)
+                    'vcodec': f.get('vcodec'),
+                    'acodec': f.get('acodec'),
+                    'resolution': f.get('resolution')
+                })
+    
+    return options
+
+# Global variable to store the final downloaded file path from yt-dlp's hooks
+# This is a fallback debugging print, not the primary method anymore
+download_complete_filepath_from_hook = None 
+
+# Callback for download progress - now primarily for UI updates and debug logging
+def update_progress(d, status_placeholder, progress_bar):
+    global download_complete_filepath_from_hook 
+    if d['status'] == 'downloading':
+        p = d.get('_percent_str', '0%').replace(' ', '')
+        speed = d.get('_speed_str', 'N/A')
+        eta = d.get('_eta_str', 'N/A')
+        status_placeholder.text(f"Downloading: {p} at {speed} ETA: {eta}")
+        try:
+            progress_bar.progress(float(d.get('_percent_str', '0%').strip('%')) / 100)
+        except ValueError:
+            pass # Ignore if percentage string is not yet a valid float
+    elif d['status'] == 'finished':
+        progress_bar.progress(1.0) # Ensure it reaches 100%
+        # Capture the actual final filepath for debug logging
+        if 'filepath' in d:
+            download_complete_filepath_from_hook = d['filepath']
+            print(f"DEBUG: Filepath captured from finished hook: {download_complete_filepath_from_hook}")
+        else:
+            print("DEBUG: 'filepath' not found in finished hook data.")
+
+
+# Function to download the selected content
+def download_content(url, selected_option, info, status_placeholder, progress_bar):
+    global download_complete_filepath_from_hook
+    download_complete_filepath_from_hook = None # Reset at the start of each download
 
     try:
+        sanitized_title = sanitize_filename(info.get('title', 'video'))
+        
+        # Determine the output filename template based on whether it's a merge
+        if selected_option['is_merged']:
+            # For merged files, the final name will often be without format_id
+            output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}.%(ext)s")
+        else:
+            # For single formats, include format_id for uniqueness as yt-dlp often does
+            output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}_%(format_id)s.%(ext)s")
+
         ydl_opts = {
-            'format': format_id,
             'outtmpl': output_filename_template,
-            'progress_hooks': [hook],
-            'external_downloader_args': ['-loglevel', 'error'],
-            # --- FFMPEG LOCATION FIX START ---
-            # IMPORTANT: Hardcoded path based on your specific input: C:\Users\admin\Documents\ffmpeg\bin
-            # Using a raw string (r'') for Windows paths to handle backslashes correctly.
-            'ffmpeg_location': '/usr/bin/ffmpeg' if os.name != 'nt' else r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe', 
-            # --- FFMPEG LOCATION FIX END ---
+            'progress_hooks': [lambda d: update_progress(d, status_placeholder, progress_bar)],
+            'ffmpeg_location': FFMPEG_LOCATION,
             'retries': 3,
+            'verbose': True,
+            'compat_opts': set(),
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.74 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Sec-Fetch-Mode': 'navigate'
+            }
         }
 
-        if final_output_type == "mp3":
+        # Configure based on output type and whether it's a merged option
+        if selected_option['is_merged']:
+            ydl_opts['format'] = selected_option['format_id']
+            ydl_opts['merge_output_format'] = 'mp4'
+            ydl_opts['postprocessors'] = [
+                {'key': 'FFmpegVideoRemuxer', 'preferedformat': 'mp4'},
+            ]
+        elif selected_option['ext'] == 'mp3':
+            ydl_opts['format'] = selected_option['format_id']
             ydl_opts['postprocessors'] = [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '320', # Highest quality for MP3
+                'preferredquality': '192',
             }]
-            ydl_opts['extract_audio'] = True
-        elif final_output_type == "mp4":
-            ydl_opts['merge_output_format'] = 'mp4'
+        else:
+            ydl_opts['format'] = selected_option['format_id']
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            # Execute the download. Hooks will run during this process.
+            download_result = ydl.download([url])
             
-            # Determine the final downloaded file path
-            if 'filepath' in info:
-                final_filepath = info['filepath']
-            elif 'requested_downloads' in info and len(info['requested_downloads']) > 0:
-                # For cases where multiple files are downloaded and merged, yt-dlp might put path in last requested_download
-                final_filepath = info['requested_downloads'][-1]['filepath']
+            # --- Robust File Path Discovery ---
+            final_downloaded_path_to_check = None
+            
+            # Sanitize title again for robust glob matching
+            sanitized_title_for_glob = sanitize_filename(info.get('title', 'video'))
+
+            if selected_option['is_merged']:
+                # For merged MP4s, the pattern is straightforward (no format ID)
+                expected_ext = 'mp4'
+                # Use glob to find files matching "title*.mp4"
+                matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}*.{expected_ext}"))
+                # Filter to prioritize exact match without format_id if it exists, otherwise first match
+                exact_match = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
+                if exact_match in matching_files:
+                    final_downloaded_path_to_check = exact_match
+                elif matching_files:
+                    final_downloaded_path_to_check = matching_files[0] # Take the first match
+            else: # Not merged (e.g., MP3 or video-only streams)
+                expected_ext = selected_option['ext'] # 'mp3' or 'mp4'/'webm' for video-only
+                # For non-merged, yt-dlp usually includes the format_id (e.g., "_140.mp3")
+                # So, search for "title_*.ext"
+                matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}_*.{expected_ext}"))
+                if matching_files:
+                    # Sort by modification time to get the most recent, if multiple exist
+                    final_downloaded_path_to_check = max(matching_files, key=os.path.getmtime)
+                else:
+                    # Fallback if yt-dlp somehow produces a simple name for non-merged (less common)
+                    simple_name_path = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
+                    if os.path.exists(simple_name_path):
+                        final_downloaded_path_to_check = simple_name_path
+
+            print(f"DEBUG: Final path determined by glob search: {final_downloaded_path_to_check}")
+
+            if final_downloaded_path_to_check and os.path.exists(final_downloaded_path_to_check):
+                st.session_state.downloaded_file = final_downloaded_path_to_check
+                status_placeholder.success(f"Download complete: {os.path.basename(final_downloaded_path_to_check)}")
             else:
-                # Fallback: Search in the temp directory for the expected file extension
-                expected_ext = 'mp3' if final_output_type == 'mp3' else 'mp4'
-                for f_name in os.listdir(TEMP_DIR):
-                    if f_name.startswith(safe_title_prefix) and f_name.endswith(f".{expected_ext}"):
-                        final_filepath = os.path.join(TEMP_DIR, f_name)
-                        break
-                if not final_filepath:
-                    raise FileNotFoundError("Could not reliably determine the final downloaded file path.")
-
-            if not os.path.exists(final_filepath):
-                raise FileNotFoundError(f"Final file not found on disk: {final_filepath}")
-
-            status_text.success("Processing complete!")
-            return final_filepath
+                status_placeholder.error(f"Download completed, but file not found at: {final_downloaded_path_to_check}. This may indicate an unexpected filename or an issue with file creation/deletion by yt-dlp/ffmpeg. Please check console for more errors.")
 
     except yt_dlp.utils.DownloadError as e:
-        status_text.error(f"Download Error: {e}. This might be due to geo-restrictions, private video, YouTube changes, or issues with the selected format.")
-        st.exception(e) # Show full traceback in console for debugging
-        return None
-    except FileNotFoundError as e:
-        status_text.error(f"File System Error: {e}")
-        st.exception(e)
-        return None
+        status_placeholder.error(f"Download Error: {e}")
+        st.error("Failed to download. Check the console/logs for details.")
     except Exception as e:
-        status_text.error(f"An unexpected error occurred during download/conversion: {e}")
-        st.exception(e)
-        return None
+        status_placeholder.error(f"An unexpected error occurred: {e}")
+        st.error("Failed to download. Check the console/logs for details.")
 
-# --- Streamlit UI Layout ---
+# --- Streamlit App Layout ---
+st.set_page_config(page_title="YouTube Downloader", page_icon="⬇️", layout="centered")
 
-st.set_page_config(
-    page_title="YouTube Converter",
-    page_icon="⬇️",
-    layout="centered"
-)
+st.title("⬇️ YouTube Downloader")
 
-st.title("⬇️ YouTube to MP3/MP4 Converter")
-st.markdown("Enter a YouTube video URL below to download it in your preferred format and quality.")
+# Input for YouTube URL
+video_url = st.text_input("Enter YouTube Video URL:")
 
-youtube_url = st.text_input("Enter YouTube Video URL:", "")
-
-# Initialize session state variables if they don't exist
+# Session state to store video info and downloaded file path
 if 'video_info' not in st.session_state:
     st.session_state.video_info = None
-if 'formats' not in st.session_state:
-    st.session_state.formats = None
-if 'selected_format_id' not in st.session_state:
-    st.session_state.selected_format_id = None
-if 'final_output_type_radio' not in st.session_state:
-    st.session_state.final_output_type_radio = "mp4" # Default to mp4
-if 'download_started' not in st.session_state:
-    st.session_state.download_started = False
 if 'downloaded_file' not in st.session_state:
     st.session_state.downloaded_file = None
 
+if video_url:
+    # Fetch video info if not already cached/fetched for this URL
+    if st.session_state.video_info is None or st.session_state.video_info.get('webpage_url') != video_url:
+        st.session_state.video_info, _ = get_video_info_and_formats(video_url) # _ for sanitized_info, not used directly here
 
-# Fetch video info only if URL changes or no info is present
-if youtube_url and (st.session_state.video_info is None or st.session_state.video_info.get('url') != youtube_url):
-    # Reset states when a new URL is entered
-    st.session_state.download_started = False
-    st.session_state.downloaded_file = None
-    st.session_state.video_info = None
-    st.session_state.formats = None
-    st.session_state.selected_format_id = None
-    
-    with st.spinner("Fetching video information... This may take a moment."):
-        title, thumbnail, duration, formats = get_video_info_and_formats(youtube_url)
-        if title:
-            st.session_state.video_info = {'title': title, 'thumbnail': thumbnail, 'duration': duration, 'url': youtube_url}
-            st.session_state.formats = formats
-            # Reset selected_format_id after new info fetch, it will be set by the dynamic selectbox logic
-            st.session_state.selected_format_id = None
-        else:
-            st.session_state.video_info = None
-            st.session_state.formats = None
-            st.session_state.selected_format_id = None
+    if st.session_state.video_info:
+        info = st.session_state.video_info
+        st.subheader(f"Video Title: {info.get('title', 'N/A')}")
+        if 'thumbnail' in info:
+            st.image(info['thumbnail'], caption="Video Thumbnail", use_column_width=True)
 
-
-# Display video info and options if info is available
-if st.session_state.video_info:
-    title = st.session_state.video_info['title']
-    thumbnail = st.session_state.video_info['thumbnail']
-    duration = st.session_state.video_info['duration']
-    all_formats = st.session_state.formats # Use all_formats to avoid confusion
-
-    st.subheader("Video Information:")
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.image(thumbnail, caption="Video Thumbnail", use_column_width=True)
-    with col2:
-        st.write(f"**Title:** {title}")
-        if duration:
-            mins, secs = divmod(duration, 60)
-            st.write(f"**Duration:** {int(mins)}m {int(secs)}s")
-        
-    st.write("---")
-    
-    st.subheader("Choose Download Quality and Output Type:")
-
-    # --- Radio button for final output type (MP4 or MP3) ---
-    st.session_state.final_output_type_radio = st.radio(
-        "Final Output Type:",
-        ("mp4", "mp3"),
-        index=0 if st.session_state.final_output_type_radio == "mp4" else 1, # Set initial state
-        horizontal=True,
-        key='output_type_radio',
-        help="Choose 'MP4' for a video file or 'MP3' to extract and convert the audio portion."
-    )
-
-    # --- Dynamic Quality/Stream Selection based on Output Type ---
-    format_display_options = [] # This will hold strings for the selectbox
-    format_id_map = {} # Maps display string back to format_id
-
-    if all_formats:
-        if st.session_state.final_output_type_radio == "mp4":
-            # Filter for MP4: Prioritize combined video+audio, then video-only (which yt-dlp can merge)
-            mp4_eligible_formats = []
-            
-            combined_video_audio = [f for f in all_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-            video_only = [f for f in all_formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
-            
-            # Sort combined by resolution (height), then total bitrate
-            combined_video_audio.sort(key=lambda x: (
-                int(x['resolution'].split('x')[1]) if x.get('resolution') and 'x' in x['resolution'] else 0,
-                x.get('tbr', 0)
-            ), reverse=True)
-            
-            # Sort video-only by resolution
-            video_only.sort(key=lambda x: (
-                int(x['resolution'].split('x')[1]) if x.get('resolution') and 'x' in x['resolution'] else 0
-            ), reverse=True)
-            
-            # Add combined formats first
-            for f in combined_video_audio:
-                mp4_eligible_formats.append(f)
-            # Then add video-only formats
-            for f in video_only:
-                mp4_eligible_formats.append(f)
-
-            if mp4_eligible_formats:
-                st.markdown("**Available MP4 Qualities (Video + Audio or Video Only):**")
-                for f in mp4_eligible_formats:
-                    # Add filesize to display if available
-                    display_str = f"{f['description']}"
-                    if f.get('filesize') is not None:
-                         display_str += f" ({f['filesize'] / (1024*1024):.2f}MB)"
-                    format_display_options.append(display_str)
-                    format_id_map[display_str] = f['format_id']
-            else:
-                st.warning("No suitable video formats found for MP4 output. Try another URL.")
-
-        elif st.session_state.final_output_type_radio == "mp3":
-            # Filter for MP3: Consider all formats that have an audio codec
-            mp3_eligible_formats = [f for f in all_formats if f.get('acodec') != 'none']
-            
-            # Sort audio formats by bitrate (abr)
-            mp3_eligible_formats.sort(key=lambda x: x.get('abr', 0), reverse=True)
-
-            if mp3_eligible_formats:
-                st.markdown("**Available MP3 Qualities (Audio Streams):**")
-                for f in mp3_eligible_formats:
-                    # Add filesize to display if available
-                    display_str = f"{f['description']}"
-                    if f.get('filesize') is not None:
-                         display_str += f" ({f['filesize'] / (1024*1024):.2f}MB)"
-                    format_display_options.append(display_str)
-                    format_id_map[display_str] = f['format_id']
-            else:
-                st.warning("No suitable audio formats found for MP3 output. Try another URL.")
-    
-    if not format_display_options:
-        st.error("No downloadable formats available based on your current selection. Please try another output type or URL.")
-        st.session_state.selected_format_id = None # Clear selected if no options
-    else:
-        # Determine initial selection for the selectbox
-        initial_selectbox_index = 0
-        if st.session_state.selected_format_id:
-            try:
-                # Find the current display string for the previously selected format_id
-                current_display_str = next(
-                    d_str for d_str, f_id in format_id_map.items() 
-                    if f_id == st.session_state.selected_format_id
-                )
-                initial_selectbox_index = format_display_options.index(current_display_str)
-            except (StopIteration, ValueError):
-                # Previous selection not found in the new filtered list, default to first
-                st.session_state.selected_format_id = None 
-                initial_selectbox_index = 0
-        
-        # If after checking, selected_format_id is still None, pick the first one from the new list
-        if st.session_state.selected_format_id is None and format_display_options:
-            st.session_state.selected_format_id = format_id_map.get(format_display_options[0])
-
-        selected_display_option = st.selectbox(
-            "Select Quality/Stream:",
-            format_display_options,
-            index=initial_selectbox_index,
-            key='quality_selectbox', # Ensure key is stable
-            help="Choose the desired quality stream. The list updates based on your 'Final Output Type' selection."
+        # Output Type Selection
+        output_type = st.radio(
+            "Select Final Output Type:",
+            ('mp4', 'mp3'),
+            index=0, # Default to MP4
+            key='output_type'
         )
+
+        # Dynamically generate and display format options based on selected output type
+        download_options = generate_download_options(info, output_type)
         
-        # Update selected_format_id based on current selectbox choice
-        st.session_state.selected_format_id = format_id_map.get(selected_display_option)
-
-        if st.session_state.selected_format_id:
-            st.info(f"Selected stream: `{st.session_state.selected_format_id}` for `{st.session_state.final_output_type_radio.upper()}` conversion.")
-
-            if st.button(f"Download as {st.session_state.final_output_type_radio.upper()}"):
-                st.session_state.downloaded_file = None # Clear previous download
-                st.session_state.download_started = True
-
-                st.write("Starting download...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                clean_temp_dir() # Ensure clean slate for new download
-
-                downloaded_file = download_file(
-                    youtube_url,
-                    st.session_state.selected_format_id,
-                    st.session_state.final_output_type_radio,
-                    progress_bar,
-                    status_text,
-                    title_prefix=title # Pass title for filename
-                )
-                
-                if downloaded_file and os.path.exists(downloaded_file):
-                    st.session_state.downloaded_file = downloaded_file
-                    
-                    file_size_mb = os.path.getsize(downloaded_file) / (1024 * 1024)
-                    st.success(f"File ready: {os.path.basename(downloaded_file)} ({file_size_mb:.2f} MB)")
-
-                    with open(downloaded_file, "rb") as file:
-                        if file_size_mb <= MAX_FILE_SIZE_MB:
-                            st.download_button(
-                                label=f"Click to Download {os.path.basename(downloaded_file)}",
-                                data=file,
-                                file_name=os.path.basename(downloaded_file),
-                                mime="video/mp4" if st.session_state.final_output_type_radio == "mp4" else "audio/mpeg",
-                                key=downloaded_file # Use a unique key for the button to reset it
-                            )
-                        else:
-                            st.warning(f"File size ({file_size_mb:.2f} MB) exceeds direct download limit ({MAX_FILE_SIZE_MB} MB).")
-                            st.info("For very large files, direct download via Streamlit's button might fail or be slow. The file is saved on the server's disk in the 'temp_downloads' directory.")
-                    
-                    # Give Streamlit a moment to process the download button click before potentially cleaning up.
-                    time.sleep(1) 
-                    st.info("The downloaded file is stored temporarily and will be removed soon.")
-                    
-                else:
-                    st.error("Failed to download or convert the video. Please check the console/logs for details.")
-                    st.session_state.downloaded_file = None
+        if not download_options:
+            st.warning("No suitable download formats found for the selected output type.")
         else:
-            st.warning("Please select a quality/stream before downloading.")
+            # Create display labels for the selectbox
+            option_labels = [opt['label'] for opt in download_options]
+            
+            selected_label = st.selectbox(
+                "Select Quality/Stream:",
+                options=option_labels,
+                index=0, # Default to the first option (likely best quality)
+                key='selected_format_label'
+            )
+            
+            # Find the full option dictionary based on the selected label
+            selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
 
-else:
-    if youtube_url:
-        pass # Error messages handled by get_video_info_and_formats (e.g., "No information found")
+            st.write(f"Selected: **{selected_option['label']}**")
+            st.write(f"Expected Extension: **.{selected_option['ext']}**")
+
+            # Download Button
+            if st.button("🚀 Start Download"):
+                st.session_state.downloaded_file = None # Reset previous download
+                status_placeholder = st.empty()
+                progress_bar = st.progress(0)
+                download_content(video_url, selected_option, info, status_placeholder, progress_bar)
+
+    else:
+        st.warning("Please enter a valid YouTube video URL.")
+
+# Download Button for the file in session state
+if st.session_state.downloaded_file and os.path.exists(st.session_state.downloaded_file):
+    with open(st.session_state.downloaded_file, "rb") as file:
+        st.download_button(
+            label="⬇️ Download File",
+            data=file,
+            file_name=os.path.basename(st.session_state.downloaded_file),
+            mime=f"application/octet-stream" # Generic mime type, browser handles extension
+        )
 
 # Sidebar for utility actions and info
 st.sidebar.title("Maintenance")
@@ -459,10 +355,10 @@ st.sidebar.markdown("""
 **How Quality Works:**
 1.  **Info Fetching:** The app uses `yt-dlp` to list *all* available video and audio streams for the given YouTube URL.
 2.  **Output Type First:** You now select your desired 'Final Output Type' (MP4 or MP3) *first*.
-3.  **Dynamic Quality Selection:** The 'Select Quality/Stream' dropdown dynamically filters to show only streams relevant to your chosen output type:
-    * **MP4:** Primarily shows streams with both video and audio. If none are available, it will show video-only streams (which `yt-dlp` will try to merge with the best available audio).
-    * **MP3:** Shows streams that contain audio (either audio-only or video+audio streams, as audio can be extracted from both).
-4.  **Download & Conversion:** After selecting your stream and output type, the app downloads the chosen stream and uses `ffmpeg` for post-processing (merging for MP4, converting to MP3).
+3.  **Dynamic Quality Selection:** The 'Select Quality/Stream' dropdown dynamically filters and sorts to show only streams relevant to your chosen output type:
+    * **MP4:** Shows video formats grouped by extension (MP4, WebM, etc.), with highest quality first within each group. For each 'Video Only' stream, a corresponding 'Video + Audio (Merged)' option will also appear. Selecting this will tell the app to download the chosen video stream and merge it with the best available audio stream using `ffmpeg`.
+    * **MP3:** Shows audio formats grouped by extension (MP3, M4A, Opus, etc.), with highest bitrate first within each group.
+4.  **Download & Conversion:** After selecting your stream and output type, the app downloads the chosen stream(s) and uses `ffmpeg` for post-processing (merging for MP4, converting to MP3).
 
 **Disclaimer:** This tool is for educational purposes only. Please respect copyright laws and YouTube's Terms of Service.
 """)
