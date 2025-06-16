@@ -40,36 +40,45 @@ create_temp_dir()
 def sanitize_filename(filename):
     # Remove characters illegal in Windows filenames, and trim leading/trailing spaces/dots
     cleaned_filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-    # Also remove any characters that might cause issues with pathing or globbing if they appear unexpectedly
-    # For robust matching, we might also replace spaces with underscores or similar if exact matches are needed,
-    # but for simple globbing, spaces are usually fine.
     # Replace sequences of dots at the end (common issue with some filenames)
     cleaned_filename = re.sub(r'\.+$', '', cleaned_filename)
     return cleaned_filename.strip() # Remove leading/trailing whitespace
 
-# Cache video info to avoid re-fetching on every rerun
-@st.cache_data(show_spinner="Fetching video information...")
-def get_video_info_and_formats(url):
+# Cache content info (video or playlist) to avoid re-fetching on every rerun
+@st.cache_data(show_spinner="Fetching content information...")
+def get_content_info(url):
     try:
         ydl_opts = {
-            'noplaylist': True,
+            'noplaylist': False, # Allow playlists
             'quiet': True,
             'skip_download': True,
-            'format': 'all', # Get all formats to allow flexible selection
+            'format': 'all',
             'force_generic_extractor': True,
             'retries': 3,
+            'extract_flat': False # Crucial for getting full info for entries in a playlist
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            
             if not info:
-                return None, None
-            return info, ydl.sanitize_info(info) # Return sanitized info for easier processing
+                return None, None, None # info, is_playlist, entries_list
+
+            is_playlist = info.get('_type') == 'playlist'
+            
+            if is_playlist:
+                entries = info.get('entries', [])
+                # Filter out None entries (e.g., private/deleted videos in a playlist)
+                entries = [e for e in entries if e is not None]
+                return info, is_playlist, entries # main playlist info, True, list of video infos
+            else:
+                return info, is_playlist, [info] # main video info, False, list containing single video info
+
     except yt_dlp.utils.DownloadError as e:
-        st.error(f"Error fetching video info: {e}")
-        return None, None
+        st.error(f"Error fetching content info: {e}")
+        return None, None, None
     except Exception as e:
         st.error(f"An unexpected error occurred: {e}")
-        return None, None
+        return None, None, None
 
 
 # Function to dynamically generate download options based on desired output type
@@ -85,10 +94,10 @@ def generate_download_options(info, output_type):
 
     if output_type == 'mp4':
         # Add "Video + Audio (Merged)" options for MP4 output
-        # We need distinct options for different video qualities + best audio
         merged_video_qualities = set()
         for f in formats:
-            if f.get('vcodec') != 'none' and f.get('ext') == 'mp4' and f.get('height') and f.get('height') not in merged_video_qualities:
+            # Filter for video-only MP4 formats to ensure proper merging with 'bestaudio'
+            if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('ext') == 'mp4' and f.get('height') and f.get('height') not in merged_video_qualities:
                 # Add an option for this video quality merged with best audio
                 options.append({
                     'label': f"Video {f['height']}p ({f['ext']}) + Best Audio (Merged MP4)",
@@ -145,8 +154,7 @@ def generate_download_options(info, output_type):
     
     return options
 
-# Global variable to store the final downloaded file path from yt-dlp's hooks
-# This is a fallback debugging print, not the primary method anymore
+# Global variable for debug logging of filepath from hook
 download_complete_filepath_from_hook = None 
 
 # Callback for download progress - now primarily for UI updates and debug logging
@@ -171,7 +179,7 @@ def update_progress(d, status_placeholder, progress_bar):
             print("DEBUG: 'filepath' not found in finished hook data.")
 
 
-# Function to download the selected content
+# Function to download a single content (video)
 def download_content(url, selected_option, info, status_placeholder, progress_bar):
     global download_complete_filepath_from_hook
     download_complete_filepath_from_hook = None # Reset at the start of each download
@@ -179,12 +187,9 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
     try:
         sanitized_title = sanitize_filename(info.get('title', 'video'))
         
-        # Determine the output filename template based on whether it's a merge
         if selected_option['is_merged']:
-            # For merged files, the final name will often be without format_id
             output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}.%(ext)s")
         else:
-            # For single formats, include format_id for uniqueness as yt-dlp often does
             output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}_%(format_id)s.%(ext)s")
 
         ydl_opts = {
@@ -194,6 +199,7 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
             'retries': 3,
             'verbose': True,
             'compat_opts': set(),
+            'noplaylist': True, # Ensure only single video is downloaded from this instance
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.74 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -202,7 +208,6 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
             }
         }
 
-        # Configure based on output type and whether it's a merged option
         if selected_option['is_merged']:
             ydl_opts['format'] = selected_option['format_id']
             ydl_opts['merge_output_format'] = 'mp4'
@@ -220,36 +225,26 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
             ydl_opts['format'] = selected_option['format_id']
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Execute the download. Hooks will run during this process.
-            download_result = ydl.download([url])
+            ydl.download([url]) # Execute the download. Hooks will run.
             
             # --- Robust File Path Discovery ---
             final_downloaded_path_to_check = None
-            
-            # Sanitize title again for robust glob matching
             sanitized_title_for_glob = sanitize_filename(info.get('title', 'video'))
 
             if selected_option['is_merged']:
-                # For merged MP4s, the pattern is straightforward (no format ID)
                 expected_ext = 'mp4'
-                # Use glob to find files matching "title*.mp4"
                 matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}*.{expected_ext}"))
-                # Filter to prioritize exact match without format_id if it exists, otherwise first match
                 exact_match = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
                 if exact_match in matching_files:
                     final_downloaded_path_to_check = exact_match
                 elif matching_files:
-                    final_downloaded_path_to_check = matching_files[0] # Take the first match
-            else: # Not merged (e.g., MP3 or video-only streams)
-                expected_ext = selected_option['ext'] # 'mp3' or 'mp4'/'webm' for video-only
-                # For non-merged, yt-dlp usually includes the format_id (e.g., "_140.mp3")
-                # So, search for "title_*.ext"
+                    final_downloaded_path_to_check = matching_files[0]
+            else:
+                expected_ext = selected_option['ext']
                 matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}_*.{expected_ext}"))
                 if matching_files:
-                    # Sort by modification time to get the most recent, if multiple exist
-                    final_downloaded_path_to_check = max(matching_files, key=os.path.getmtime)
+                    final_downloaded_path_to_check = max(matching_files, key=os.path.getmtime) # Get most recent
                 else:
-                    # Fallback if yt-dlp somehow produces a simple name for non-merged (less common)
                     simple_name_path = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
                     if os.path.exists(simple_name_path):
                         final_downloaded_path_to_check = simple_name_path
@@ -257,7 +252,7 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
             print(f"DEBUG: Final path determined by glob search: {final_downloaded_path_to_check}")
 
             if final_downloaded_path_to_check and os.path.exists(final_downloaded_path_to_check):
-                st.session_state.downloaded_file = final_downloaded_path_to_check
+                st.session_state.downloaded_files.append(final_downloaded_path_to_check) # Append to list
                 status_placeholder.success(f"Download complete: {os.path.basename(final_downloaded_path_to_check)}")
             else:
                 status_placeholder.error(f"Download completed, but file not found at: {final_downloaded_path_to_check}. This may indicate an unexpected filename or an issue with file creation/deletion by yt-dlp/ffmpeg. Please check console for more errors.")
@@ -269,86 +264,267 @@ def download_content(url, selected_option, info, status_placeholder, progress_ba
         status_placeholder.error(f"An unexpected error occurred: {e}")
         st.error("Failed to download. Check the console/logs for details.")
 
+
+# Function to download multiple contents (for playlists)
+def download_content_for_playlist(selected_entries, selected_option, status_placeholder, progress_bar):
+    total_videos = len(selected_entries)
+    if total_videos == 0:
+        status_placeholder.warning("No videos selected for download.")
+        return
+
+    st.session_state.downloaded_files = [] # Clear previous downloads for playlist
+    
+    for i, entry_info in enumerate(selected_entries):
+        if not entry_info: # Skip None entries (e.g., private/deleted videos in a playlist)
+            continue
+
+        video_url = entry_info.get('webpage_url')
+        if not video_url:
+            status_placeholder.warning(f"Skipping video {i+1}: URL not found for {entry_info.get('title', 'Untitled')}")
+            continue
+
+        status_placeholder.text(f"Downloading video {i+1}/{total_videos}: {entry_info.get('title', '...')}")
+        # Update overall playlist progress by number of videos processed
+        progress_bar.progress((i / total_videos)) 
+
+        # Reset hook global for each video download (mostly for debug logging)
+        global download_complete_filepath_from_hook
+        download_complete_filepath_from_hook = None
+
+        try:
+            sanitized_title = sanitize_filename(entry_info.get('title', 'video'))
+            
+            if selected_option['is_merged']:
+                output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}.%(ext)s")
+            else:
+                output_filename_template = os.path.join(TEMP_DIR, f"{sanitized_title}_%(format_id)s.%(ext)s")
+
+            ydl_opts = {
+                'outtmpl': output_filename_template,
+                'progress_hooks': [lambda d: update_progress(d, status_placeholder, progress_bar)],
+                'ffmpeg_location': FFMPEG_LOCATION,
+                'retries': 3,
+                'verbose': True,
+                'compat_opts': set(),
+                'noplaylist': True, # Crucial: ensure only this single video is downloaded by this YDL instance
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.74 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-us,en;q=0.5',
+                    'Sec-Fetch-Mode': 'navigate'
+                }
+            }
+
+            if selected_option['is_merged']:
+                ydl_opts['format'] = selected_option['format_id']
+                ydl_opts['merge_output_format'] = 'mp4'
+                ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoRemuxer', 'preferedformat': 'mp4'}]
+            elif selected_option['ext'] == 'mp3':
+                ydl_opts['format'] = selected_option['format_id']
+                ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+            else:
+                ydl_opts['format'] = selected_option['format_id']
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url]) # Download the current video in the loop
+
+                # --- Robust File Path Discovery for the current video ---
+                final_downloaded_path_to_check = None
+                sanitized_title_for_glob = sanitize_filename(entry_info.get('title', 'video'))
+
+                if selected_option['is_merged']:
+                    expected_ext = 'mp4'
+                    matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}*.{expected_ext}"))
+                    exact_match = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
+                    if exact_match in matching_files:
+                        final_downloaded_path_to_check = exact_match
+                    elif matching_files:
+                        final_downloaded_path_to_check = matching_files[0] # Take the first match
+                else:
+                    expected_ext = selected_option['ext']
+                    matching_files = glob.glob(os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}_*.{expected_ext}"))
+                    if matching_files:
+                        final_downloaded_path_to_check = max(matching_files, key=os.path.getmtime) # Get most recent
+                    else:
+                        simple_name_path = os.path.join(TEMP_DIR, f"{sanitized_title_for_glob}.{expected_ext}")
+                        if os.path.exists(simple_name_path):
+                            final_downloaded_path_to_check = simple_name_path
+
+                if final_downloaded_path_to_check and os.path.exists(final_downloaded_path_to_check):
+                    st.session_state.downloaded_files.append(final_downloaded_path_to_check)
+                    status_placeholder.text(f"Downloaded: {os.path.basename(final_downloaded_path_to_check)} ({i+1}/{total_videos})")
+                else:
+                    status_placeholder.error(f"Failed to find downloaded file for {entry_info.get('title', 'Untitled')} at {final_downloaded_path_to_check}")
+
+        except yt_dlp.utils.DownloadError as e:
+            status_placeholder.error(f"Error downloading {entry_info.get('title', 'Untitled')}: {e}")
+        except Exception as e:
+            status_placeholder.error(f"An unexpected error occurred for {entry_info.get('title', 'Untitled')}: {e}")
+
+    progress_bar.progress(1.0) # Ensure overall progress reaches 100%
+    if st.session_state.downloaded_files:
+        status_placeholder.success(f"Playlist download complete. Downloaded {len(st.session_state.downloaded_files)} out of {total_videos} videos.")
+    else:
+        status_placeholder.warning("No files were successfully downloaded from the playlist.")
+
+
 # --- Streamlit App Layout ---
 st.set_page_config(page_title="YouTube Downloader", page_icon="⬇️", layout="centered")
 
 st.title("⬇️ YouTube Downloader")
 
 # Input for YouTube URL
-video_url = st.text_input("Enter YouTube Video URL:")
+video_url = st.text_input("Enter YouTube Video or Playlist URL:")
 
-# Session state to store video info and downloaded file path
-if 'video_info' not in st.session_state:
-    st.session_state.video_info = None
-if 'downloaded_file' not in st.session_state:
-    st.session_state.downloaded_file = None
+# Session state to store content info (video or playlist) and downloaded files
+if 'content_info' not in st.session_state:
+    st.session_state.content_info = None
+if 'is_playlist' not in st.session_state:
+    st.session_state.is_playlist = False
+if 'playlist_entries' not in st.session_state:
+    st.session_state.playlist_entries = []
+if 'downloaded_files' not in st.session_state: # This will now be a list of downloaded file paths
+    st.session_state.downloaded_files = []
 
 if video_url:
-    # Fetch video info if not already cached/fetched for this URL
-    if st.session_state.video_info is None or st.session_state.video_info.get('webpage_url') != video_url:
-        st.session_state.video_info, _ = get_video_info_and_formats(video_url) # _ for sanitized_info, not used directly here
+    # Fetch content info if not already cached/fetched for this URL
+    # Use content_info.get('webpage_url') as a unique identifier for the cached entry
+    if st.session_state.content_info is None or st.session_state.content_info.get('webpage_url') != video_url:
+        st.session_state.content_info, st.session_state.is_playlist, st.session_state.playlist_entries = get_content_info(video_url)
 
-    if st.session_state.video_info:
-        info = st.session_state.video_info
-        st.subheader(f"Video Title: {info.get('title', 'N/A')}")
-        if 'thumbnail' in info:
-            st.image(info['thumbnail'], caption="Video Thumbnail", use_column_width=True)
+    if st.session_state.content_info:
+        info = st.session_state.content_info
 
-        # Output Type Selection
-        output_type = st.radio(
-            "Select Final Output Type:",
-            ('mp4', 'mp3'),
-            index=0, # Default to MP4
-            key='output_type'
-        )
+        if st.session_state.is_playlist:
+            st.subheader(f"Playlist Title: {info.get('title', 'N/A')}")
+            st.write(f"Number of videos: {len(st.session_state.playlist_entries)}")
+            if 'thumbnail' in info:
+                st.image(info['thumbnail'], caption="Playlist Thumbnail", width=200) # Smaller thumbnail for playlist
 
-        # Dynamically generate and display format options based on selected output type
-        download_options = generate_download_options(info, output_type)
-        
-        if not download_options:
-            st.warning("No suitable download formats found for the selected output type.")
-        else:
-            # Create display labels for the selectbox
-            option_labels = [opt['label'] for opt in download_options]
+            # Option to download entire playlist or select specific videos
+            download_scope = st.radio(
+                "Download Scope:",
+                ("Download Entire Playlist", "Select Specific Videos"),
+                index=0, # Default to downloading entire playlist
+                key='download_scope'
+            )
+
+            selected_videos_for_download = []
+            if download_scope == "Select Specific Videos":
+                st.subheader("Select Videos to Download:")
+                # Use checkboxes for each video in the playlist
+                for i, entry in enumerate(st.session_state.playlist_entries):
+                    if entry: # Ensure entry is not None
+                        # Use video ID for unique key if available, else index
+                        if st.checkbox(f"{i+1}. {entry.get('title', 'Untitled Video')}", key=f'video_select_{entry.get("id", i)}'):
+                            selected_videos_for_download.append(entry)
+                if not selected_videos_for_download:
+                    st.warning("Please select at least one video from the playlist.")
+                    st.stop() # Stop execution if no videos are selected in this mode
+            else: # Download Entire Playlist
+                selected_videos_for_download = st.session_state.playlist_entries
             
+            # If no valid videos are found even for "Download Entire Playlist" (e.g., empty playlist)
+            if not selected_videos_for_download:
+                 st.warning("No valid videos found in this playlist to determine download options.")
+                 st.stop() # Stop execution here if nothing can be downloaded
+
+
+            # Use the first valid selected video's info for format options
+            # This assumes formats are generally similar across videos in a playlist.
+            first_valid_entry_for_formats = next((e for e in selected_videos_for_download if e is not None), None)
+
+            if not first_valid_entry_for_formats:
+                st.warning("Could not retrieve format information for selected videos.")
+                st.stop()
+            
+            st.write("---") # Separator
+            st.subheader("Download Options for Selected Videos:")
+            output_type = st.radio(
+                "Select Final Output Type:",
+                ('mp4', 'mp3'),
+                index=0,
+                key='playlist_output_type'
+            )
+            download_options = generate_download_options(first_valid_entry_for_formats, output_type)
+            
+            if not download_options:
+                st.warning("No suitable download formats found for the selected output type for these videos.")
+                st.stop()
+
             selected_label = st.selectbox(
                 "Select Quality/Stream:",
-                options=option_labels,
-                index=0, # Default to the first option (likely best quality)
-                key='selected_format_label'
+                options=[opt['label'] for opt in download_options],
+                index=0,
+                key='playlist_selected_format_label'
             )
-            
-            # Find the full option dictionary based on the selected label
             selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
 
-            st.write(f"Selected: **{selected_option['label']}**")
-            st.write(f"Expected Extension: **.{selected_option['ext']}**")
-
-            # Download Button
-            if st.button("🚀 Start Download"):
-                st.session_state.downloaded_file = None # Reset previous download
+            if st.button("🚀 Start Download Selected Videos"):
+                st.session_state.downloaded_files = [] # Reset list of downloaded files
                 status_placeholder = st.empty()
                 progress_bar = st.progress(0)
+                # Call the new playlist download function
+                download_content_for_playlist(selected_videos_for_download, selected_option, status_placeholder, progress_bar)
+
+
+        else: # Single video mode
+            st.subheader(f"Video Title: {info.get('title', 'N/A')}")
+            if 'thumbnail' in info:
+                st.image(info['thumbnail'], caption="Video Thumbnail", use_column_width=True)
+
+            output_type = st.radio(
+                "Select Final Output Type:",
+                ('mp4', 'mp3'),
+                index=0,
+                key='single_video_output_type'
+            )
+            download_options = generate_download_options(info, output_type)
+            
+            if not download_options:
+                st.warning("No suitable download formats found for the selected output type.")
+                st.stop()
+
+            selected_label = st.selectbox(
+                "Select Quality/Stream:",
+                options=[opt['label'] for opt in download_options],
+                index=0,
+                key='single_video_selected_format_label'
+            )
+            selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
+
+            if st.button("🚀 Start Download"):
+                st.session_state.downloaded_files = [] # Reset list for single video
+                status_placeholder = st.empty()
+                progress_bar = st.progress(0)
+                # Call original download_content for a single video
                 download_content(video_url, selected_option, info, status_placeholder, progress_bar)
 
     else:
-        st.warning("Please enter a valid YouTube video URL.")
+        st.warning("Please enter a valid YouTube video or playlist URL.")
 
-# Download Button for the file in session state
-if st.session_state.downloaded_file and os.path.exists(st.session_state.downloaded_file):
-    with open(st.session_state.downloaded_file, "rb") as file:
-        st.download_button(
-            label="⬇️ Download File",
-            data=file,
-            file_name=os.path.basename(st.session_state.downloaded_file),
-            mime=f"application/octet-stream" # Generic mime type, browser handles extension
-        )
+# Display download buttons for all downloaded files in session state
+if st.session_state.downloaded_files:
+    st.subheader("Downloaded Files:")
+    for file_path in st.session_state.downloaded_files:
+        if os.path.exists(file_path):
+            file_name = os.path.basename(file_path)
+            with open(file_path, "rb") as file:
+                st.download_button(
+                    label=f"⬇️ {file_name}",
+                    data=file,
+                    file_name=file_name,
+                    mime=f"application/octet-stream",
+                    key=f'download_button_{file_path}' # Use file_path as key for uniqueness
+                )
+        else:
+            st.warning(f"File not found on disk: {os.path.basename(file_path)}")
 
 # Sidebar for utility actions and info
 st.sidebar.title("Maintenance")
 if st.sidebar.button("Clean Temporary Downloads"):
     clean_temp_dir()
-    st.session_state.downloaded_file = None # Clear download state if temp files are cleaned
+    st.session_state.downloaded_files = [] # Clear download state if temp files are cleaned
 
 st.sidebar.markdown("""
 ---
