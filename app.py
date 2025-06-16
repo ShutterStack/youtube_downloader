@@ -48,6 +48,7 @@ def sanitize_filename(filename):
 # Cache content info (video or playlist) to avoid re-fetching on every rerun
 @st.cache_data(show_spinner="Fetching content information...")
 def get_content_info(url):
+    info = None # Initialize info to None
     try:
         ydl_opts = {
             'noplaylist': False, # Allow playlists
@@ -57,15 +58,15 @@ def get_content_info(url):
             'force_generic_extractor': True,
             'retries': 3,
             'extract_flat': False, # Crucial for getting full info for entries in a playlist
-            'ignore_errors': True # <--- ADDED THIS LINE for playlist resilience
+            'ignore_errors': True # This ensures playlist processing continues even with unavailable videos
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
             if not info:
-                # If info is None even with ignore_errors, it means playlist itself might be entirely invalid
+                # If info is None even with ignore_errors, it means URL might be invalid or completely inaccessible
                 st.error("Could not retrieve any information for the provided URL. It might be invalid or completely unavailable.")
-                return None, None, None # info, is_playlist, entries_list
+                return {'title': 'Content Not Found', 'webpage_url': url, '_type': 'video'}, False, []
 
             is_playlist = info.get('_type') == 'playlist'
             
@@ -74,25 +75,45 @@ def get_content_info(url):
                 # Filter out None entries and entries marked as explicitly unavailable/private
                 # yt-dlp might return None for some entries if they're unavailable/deleted
                 # or an entry dictionary with 'availability': 'unavailable'
-                entries = [e for e in entries if e is not None and e.get('availability') not in ['private', 'unlisted', 'unavailable']]
-                return info, is_playlist, entries # main playlist info, True, list of video infos
+                valid_entries = [e for e in entries if e is not None and e.get('availability') not in ['private', 'unlisted', 'unavailable']]
+                return info, is_playlist, valid_entries # main playlist info, True, list of video infos
             else:
-                # For single videos, if info is not None but status is unavailable,
-                # we should still return it so the main app can show the error from yt-dlp.
-                return info, is_playlist, [info]
+                return info, is_playlist, [info] # main video info, False, list containing single video info
 
     except yt_dlp.utils.DownloadError as e:
-        st.error(f"Error fetching content info: {e}")
-        return None, None, None
+        st.error(f"Error fetching content info for {url}: {e}")
+        # Create a minimal info dict to allow the app to continue without crashing
+        # and display a message that content is unavailable.
+        error_info = info if info else {
+            'title': 'Content Unavailable/Error', 
+            'webpage_url': url, 
+            '_type': 'video' # Default to video type if original type is unknown due to error
+        }
+        # Heuristic: if URL contains 'playlist', try to set type to playlist
+        if 'playlist' in url.lower() and not error_info.get('_type') == 'video':
+             error_info['_type'] = 'playlist'
+
+        return error_info, error_info.get('_type') == 'playlist', [] # Return empty entries list on error
     except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
-        return None, None, None
+        st.error(f"An unexpected error occurred for {url}: {e}")
+        error_info = info if info else {
+            'title': 'An Error Occurred', 
+            'webpage_url': url, 
+            '_type': 'video'
+        }
+        if 'playlist' in url.lower() and not error_info.get('_type') == 'video':
+             error_info['_type'] = 'playlist'
+        return error_info, error_info.get('_type') == 'playlist', []
 
 
 # Function to dynamically generate download options based on desired output type
 def generate_download_options(info, output_type):
     options = []
     
+    # Check if 'formats' key exists and is not None
+    if not info or 'formats' not in info or not info['formats']:
+        return [] # No formats available
+
     # Sort formats by quality (higher resolution first, then higher fps)
     formats = sorted(info['formats'], key=lambda f: (
         f.get('height') or 0, 
@@ -296,11 +317,14 @@ def download_content_for_playlist(selected_entries, selected_option, status_plac
     
     for i, entry_info in enumerate(selected_entries):
         if not entry_info: # Skip None entries (e.g., private/deleted videos in a playlist)
+            status_placeholder.info(f"Skipping empty entry {i+1} in playlist.")
             continue
 
         video_url = entry_info.get('webpage_url')
-        if not video_url:
-            status_placeholder.warning(f"Skipping video {i+1}: URL not found for {entry_info.get('title', 'Untitled')}")
+        # Also check for 'availability' directly from the entry_info
+        if not video_url or entry_info.get('availability') in ['private', 'unlisted', 'unavailable', 'removed_by_youtube', 'removed_by_user']:
+            title_display = entry_info.get('title', 'Untitled Video')
+            status_placeholder.warning(f"Skipping video {i+1}: '{title_display}' is unavailable or URL not found.")
             continue
 
         status_placeholder.text(f"Downloading video {i+1}/{total_videos}: {entry_info.get('title', '...')}")
@@ -432,65 +456,61 @@ if video_url:
             selected_videos_for_download = []
             if download_scope == "Select Specific Videos":
                 st.subheader("Select Videos to Download:")
-                # Use checkboxes for each video in the playlist
                 for i, entry in enumerate(st.session_state.playlist_entries):
                     if entry: # Ensure entry is not None
                         # Use video ID for unique key if available, else index
                         if st.checkbox(f"{i+1}. {entry.get('title', 'Untitled Video')}", key=f'video_select_{entry.get("id", i)}'):
                             selected_videos_for_download.append(entry)
                 if not selected_videos_for_download:
-                    st.warning("Please select at least one video from the playlist.")
-                    st.stop() # Stop execution if no videos are selected in this mode
+                    st.warning("Please select at least one video from the playlist to enable download options.")
+                    # Do not st.stop(), just prevent showing download options/button
             else: # Download Entire Playlist
                 selected_videos_for_download = st.session_state.playlist_entries
             
-            # If no valid videos are found even for "Download Entire Playlist" (e.g., empty playlist)
-            if not selected_videos_for_download:
-                 st.warning("No valid videos found in this playlist to determine download options.")
-                 st.stop() # Stop execution here if nothing can be downloaded
-
-
-            # Use the first valid selected video's info for format options
-            # This assumes formats are generally similar across videos in a playlist.
+            # This check is crucial to ensure we have content to generate options for
+            # before attempting to generate download options.
             first_valid_entry_for_formats = next((e for e in selected_videos_for_download if e is not None), None)
 
             if not first_valid_entry_for_formats:
-                st.warning("Could not retrieve format information for selected videos.")
-                st.stop()
-            
-            st.write("---") # Separator
-            st.subheader("Download Options for Selected Videos:")
-            output_type = st.radio(
-                "Select Final Output Type:",
-                ('mp4', 'mp3'),
-                index=0,
-                key='playlist_output_type'
-            )
-            download_options = generate_download_options(first_valid_entry_for_formats, output_type)
-            
-            if not download_options:
-                st.warning("No suitable download formats found for the selected output type for these videos.")
-                st.stop()
+                if selected_videos_for_download: # Some videos selected, but none are valid for formats
+                     st.warning("Could not retrieve format information for selected videos. They might be unavailable or private.")
+                elif st.session_state.is_playlist and not st.session_state.playlist_entries and not st.session_state.content_info.get('formats'):
+                     st.warning("No valid videos found in this playlist. It might be empty, all videos are unavailable, or information could not be retrieved.")
+                # No st.stop(), allow the app to render. Download button will not appear if no options.
+            else:
+                st.write("---") # Separator
+                st.subheader("Download Options for Selected Videos:")
+                output_type = st.radio(
+                    "Select Final Output Type:",
+                    ('mp4', 'mp3'),
+                    index=0,
+                    key='playlist_output_type'
+                )
+                download_options = generate_download_options(first_valid_entry_for_formats, output_type)
+                
+                if not download_options:
+                    st.warning("No suitable download formats found for the selected output type for these videos.")
+                    # No st.stop(), allow the app to render. Download button will not appear.
+                else:
+                    selected_label = st.selectbox(
+                        "Select Quality/Stream:",
+                        options=[opt['label'] for opt in download_options],
+                        index=0,
+                        key='playlist_selected_format_label'
+                    )
+                    selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
 
-            selected_label = st.selectbox(
-                "Select Quality/Stream:",
-                options=[opt['label'] for opt in download_options],
-                index=0,
-                key='playlist_selected_format_label'
-            )
-            selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
-
-            if st.button("🚀 Start Download Selected Videos"):
-                st.session_state.downloaded_files = [] # Reset list of downloaded files
-                status_placeholder = st.empty()
-                progress_bar = st.progress(0)
-                # Call the new playlist download function
-                download_content_for_playlist(selected_videos_for_download, selected_option, status_placeholder, progress_bar)
+                    if st.button("🚀 Start Download Selected Videos"):
+                        st.session_state.downloaded_files = [] # Reset list of downloaded files
+                        status_placeholder = st.empty()
+                        progress_bar = st.progress(0)
+                        # Call the new playlist download function
+                        download_content_for_playlist(selected_videos_for_download, selected_option, status_placeholder, progress_bar)
 
 
         else: # Single video mode
             st.subheader(f"Video Title: {info.get('title', 'N/A')}")
-            # Deprecated parameter fix for st.image (replaced use_column_width=True with width)
+            # Corrected usage of st.image parameter for width
             if 'thumbnail' in info:
                 st.image(info['thumbnail'], caption="Video Thumbnail", use_container_width=True)
 
@@ -503,23 +523,23 @@ if video_url:
             download_options = generate_download_options(info, output_type)
             
             if not download_options:
-                st.warning("No suitable download formats found for the selected output type.")
-                st.stop()
+                st.warning("No suitable download formats found for the selected output type for this content. It might be unavailable or private.")
+                # Removed st.stop(), allow app to continue
+            else:
+                selected_label = st.selectbox(
+                    "Select Quality/Stream:",
+                    options=[opt['label'] for opt in download_options],
+                    index=0,
+                    key='single_video_selected_format_label'
+                )
+                selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
 
-            selected_label = st.selectbox(
-                "Select Quality/Stream:",
-                options=[opt['label'] for opt in download_options],
-                index=0,
-                key='single_video_selected_format_label'
-            )
-            selected_option = next(opt for opt in download_options if opt['label'] == selected_label)
-
-            if st.button("🚀 Start Download"):
-                st.session_state.downloaded_files = [] # Reset list for single video
-                status_placeholder = st.empty()
-                progress_bar = st.progress(0)
-                # Call original download_content for a single video
-                download_content(video_url, selected_option, info, status_placeholder, progress_bar)
+                if st.button("🚀 Start Download"):
+                    st.session_state.downloaded_files = [] # Reset list for single video
+                    status_placeholder = st.empty()
+                    progress_bar = st.progress(0)
+                    # Call original download_content for a single video
+                    download_content(video_url, selected_option, info, status_placeholder, progress_bar)
 
     else:
         st.warning("Please enter a valid YouTube video or playlist URL.")
