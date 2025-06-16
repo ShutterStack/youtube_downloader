@@ -1,0 +1,7 @@
+yt-dlp
+ffmpeg-python
+ffmpeg
+streamlit==1.31.0 
+pytube>=15.0.0
+pillow==10.2.0 
+requests==2.31.0
