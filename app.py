@@ -164,7 +164,7 @@ def download_file(url, format_id, final_output_type, progress_bar, status_text, 
             # --- FFMPEG LOCATION FIX START ---
             # IMPORTANT: Hardcoded path based on your specific input: C:\Users\admin\Documents\ffmpeg\bin
             # Using a raw string (r'') for Windows paths to handle backslashes correctly.
-            'ffmpeg_location': r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe', 
+            'ffmpeg_location': '/usr/bin/ffmpeg' if os.name != 'nt' else r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe', 
             # --- FFMPEG LOCATION FIX END ---
             'retries': 3,
         }
