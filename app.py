@@ -8,13 +8,13 @@ import time
 import glob # Import glob for file searching
 
 # --- Configuration ---
-TEMP_DIR = "temporary_downloads"
+TEMP_DIR = "temp_downloads"
 MAX_FILE_SIZE_MB = 500
 # Ensure ffmpeg_location is correctly set for your system
 # IMPORTANT: Adjust this path if your ffmpeg.exe is located elsewhere!
 # On Windows, it should point directly to ffmpeg.exe
 # On Linux/macOS, it's usually just 'ffmpeg' if it's in your PATH, or a full path like '/usr/bin/ffmpeg'
-FFMPEG_LOCATION = 'ffmpeg' # Adjusted for Windows based on your logs
+FFMPEG_LOCATION = '/usr/bin/ffmpeg' if os.name != 'nt' else r'C:\Users\admin\Documents\ffmpeg\bin\ffmpeg.exe', # Adjusted for Windows based on your logs
 
 
 # --- Helper Functions ---
